@@ -21,16 +21,87 @@ import (
 	"github.com/aws/aws-sdk-go-v2/service/s3"
 	"github.com/joho/godotenv"
 	"github.com/justinas/alice"
+
+	"github.com/golang-migrate/migrate/v4"
+	_ "github.com/golang-migrate/migrate/v4/database/postgres"
+	_ "github.com/golang-migrate/migrate/v4/source/file"
+
+	"database/sql"
+	"github.com/coreos/go-oidc"
+	"github.com/golang-jwt/jwt/v4"
+	_ "github.com/lib/pq"
+	"golang.org/x/oauth2"
+)
+
+func runMigrations() {
+	// Run migrations
+	m, err := migrate.New(
+		"file://migrations",
+		"postgres://myuser:mypassword@localhost:5432/mydb?sslmode=disable",
+	)
+	if err != nil {
+		log.Fatalf("Migration creation error: %v", err)
+	}
+	if err := m.Up(); err != nil && err != migrate.ErrNoChange {
+		log.Fatalf("Migration up error: %v", err)
+	}
+	log.Println("Migrations applied successfully")
+}
+
+var (
+	// OAuth2 and OIDC configuration
+	oauth2Config *oauth2.Config
+	provider     *oidc.Provider
+	verifier     *oidc.IDTokenVerifier
+
+	// JWT signing key (should be stored securely in .env)
+	jwtSigningKey []byte
+
+	// PostgreSQL connection
+	db *sql.DB
 )
 
 // Global S3 client
 var s3Client *s3.Client
 
 func main() {
+	// Run migrations
+	runMigrations()
+
 	// Load environment variables
 	if err := godotenv.Load(); err != nil {
 		log.Fatalf("Error loading .env file: %v", err)
 	}
+
+	// Set JWT signing key from env variable
+	jwtSigningKey = []byte(os.Getenv("JWT_SIGNING_KEY"))
+	if len(jwtSigningKey) == 0 {
+		log.Fatalf("JWT_SIGNING_KEY must be set in .env")
+	}
+
+	// Connect to PostgreSQL
+	var err error
+	db, err = sql.Open("postgres", os.Getenv("DATABASE_URL"))
+	if err != nil {
+		log.Fatalf("DB connection error: %v", err)
+	}
+
+	// Initialize OIDC provider for Google
+	ctx := context.Background()
+	provider, err = oidc.NewProvider(ctx, "https://accounts.google.com")
+	if err != nil {
+		log.Fatalf("Failed to initialize OIDC provider: %v", err)
+	}
+
+	clientID := os.Getenv("GOOGLE_CLIENT_ID")
+	oauth2Config = &oauth2.Config{
+		ClientID:     clientID,
+		ClientSecret: os.Getenv("GOOGLE_CLIENT_SECRET"),
+		RedirectURL:  os.Getenv("GOOGLE_REDIRECT_URL"),
+		Endpoint:     provider.Endpoint(),
+		Scopes:       []string{oidc.ScopeOpenID, "profile", "email"},
+	}
+	verifier = provider.Verifier(&oidc.Config{ClientID: clientID})
 
 	awsRegion := os.Getenv("AWS_REGION")
 	s3BucketName := os.Getenv("S3_BUCKET_NAME")
@@ -45,6 +116,10 @@ func main() {
 	s3Client = s3.NewFromConfig(cfg)
 
 	commonChain := alice.New(logMiddleware, corsMiddleware)
+	http.Handle("/auth/google", commonChain.Then(http.HandlerFunc(handleGoogleLogin)))
+	http.Handle("/auth/google/callback", commonChain.Then(http.HandlerFunc(handleGoogleCallback)))
+	http.Handle("/auth/refresh", commonChain.Then(http.HandlerFunc(handleRefresh)))
+
 	http.Handle("/create-folder", commonChain.Then(http.HandlerFunc(createFolderHandler)))
 	http.Handle("/folders", commonChain.Then(http.HandlerFunc(listFoldersHandler)))
 	http.Handle("/upload", commonChain.Then(http.HandlerFunc(uploadHandler)))
@@ -373,4 +448,167 @@ func deleteFileFromS3(key string) error {
 		Key:    aws.String(key),
 	})
 	return err
+}
+
+func generateJWT(userID int, email, deviceID string, duration time.Duration) (string, error) {
+	claims := jwt.MapClaims{
+		"user_id":   userID,
+		"email":     email,
+		"device_id": deviceID, // unique identifier for the client device
+		"exp":       time.Now().Add(duration).Unix(),
+	}
+	token := jwt.NewWithClaims(jwt.SigningMethodHS256, claims)
+	return token.SignedString(jwtSigningKey)
+}
+
+// handleGoogleLogin initiates the OAuth2 login.
+func handleGoogleLogin(w http.ResponseWriter, r *http.Request) {
+	// Generate a state string in production.
+	state := "state"
+	http.Redirect(w, r, oauth2Config.AuthCodeURL(state), http.StatusFound)
+}
+
+// handleRefresh issues a new access token using the refresh token.
+func handleRefresh(w http.ResponseWriter, r *http.Request) {
+	cookie, err := r.Cookie("refresh_token")
+	if err != nil {
+		http.Error(w, "No refresh token", http.StatusUnauthorized)
+		return
+	}
+	refreshToken := cookie.Value
+	token, err := jwt.Parse(refreshToken, func(token *jwt.Token) (interface{}, error) {
+		if _, ok := token.Method.(*jwt.SigningMethodHMAC); !ok {
+			return nil, fmt.Errorf("Unexpected signing method")
+		}
+		return jwtSigningKey, nil
+	})
+	if err != nil || !token.Valid {
+		http.Error(w, "Invalid refresh token", http.StatusUnauthorized)
+		return
+	}
+	claims, ok := token.Claims.(jwt.MapClaims)
+	if !ok {
+		http.Error(w, "Invalid token claims", http.StatusUnauthorized)
+		return
+	}
+	userIDFloat, ok := claims["user_id"].(float64)
+	if !ok {
+		http.Error(w, "Invalid user id", http.StatusUnauthorized)
+		return
+	}
+	userID := int(userIDFloat)
+	email, ok := claims["email"].(string)
+	if !ok {
+		http.Error(w, "Invalid email", http.StatusUnauthorized)
+		return
+	}
+
+	// Use the remote address as the device identifier.
+	deviceID := r.RemoteAddr
+
+	// Issue new tokens.
+	accessToken, err := generateJWT(userID, email, deviceID, 15*time.Minute)
+	if err != nil {
+		http.Error(w, "Failed to generate access token", http.StatusInternalServerError)
+		return
+	}
+	newRefreshToken, err := generateJWT(userID, email, deviceID, 7*24*time.Hour)
+	if err != nil {
+		http.Error(w, "Failed to generate refresh token", http.StatusInternalServerError)
+		return
+	}
+	http.SetCookie(w, &http.Cookie{
+		Name:     "refresh_token",
+		Value:    newRefreshToken,
+		HttpOnly: true,
+		Secure:   false,
+		Path:     "/",
+		Expires:  time.Now().Add(7 * 24 * time.Hour),
+	})
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(map[string]string{"access_token": accessToken})
+}
+
+// handleGoogleCallback handles the OAuth2 callback from Google.
+func handleGoogleCallback(w http.ResponseWriter, r *http.Request) {
+	ctx := r.Context()
+	code := r.URL.Query().Get("code")
+	if code == "" {
+		http.Error(w, "No code provided", http.StatusBadRequest)
+		return
+	}
+
+	// Exchange the authorization code for tokens.
+	token, err := oauth2Config.Exchange(ctx, code)
+	if err != nil {
+		http.Error(w, "Token exchange failed: "+err.Error(), http.StatusInternalServerError)
+		return
+	}
+
+	// Retrieve the ID token from the OAuth2 token.
+	rawIDToken, ok := token.Extra("id_token").(string)
+	if !ok {
+		http.Error(w, "No id_token found", http.StatusInternalServerError)
+		return
+	}
+
+	// Verify the ID token.
+	idToken, err := verifier.Verify(ctx, rawIDToken)
+	if err != nil {
+		http.Error(w, "Failed to verify ID token: "+err.Error(), http.StatusInternalServerError)
+		return
+	}
+
+	// Parse claims from the ID token.
+	var claims struct {
+		Email string `json:"email"`
+		Name  string `json:"name"`
+		Sub   string `json:"sub"`
+	}
+	if err := idToken.Claims(&claims); err != nil {
+		http.Error(w, "Failed to parse claims: "+err.Error(), http.StatusInternalServerError)
+		return
+	}
+
+	// Use the remote address as the device identifier.
+	deviceID := r.RemoteAddr
+
+	// Upsert the user in the PostgreSQL database.
+	var userID int
+	err = db.QueryRowContext(ctx, `
+		INSERT INTO users (provider, provider_id, email, name)
+		VALUES ($1, $2, $3, $4)
+		ON CONFLICT (email) DO UPDATE SET name = EXCLUDED.name
+		RETURNING id
+	`, "google", claims.Sub, claims.Email, claims.Name).Scan(&userID)
+	if err != nil {
+		http.Error(w, "DB error: "+err.Error(), http.StatusInternalServerError)
+		return
+	}
+
+	// Generate JWT tokens including the device identifier.
+	accessToken, err := generateJWT(userID, claims.Email, deviceID, 15*time.Minute)
+	if err != nil {
+		http.Error(w, "Failed to generate access token: "+err.Error(), http.StatusInternalServerError)
+		return
+	}
+	refreshToken, err := generateJWT(userID, claims.Email, deviceID, 7*24*time.Hour)
+	if err != nil {
+		http.Error(w, "Failed to generate refresh token: "+err.Error(), http.StatusInternalServerError)
+		return
+	}
+
+	// Set the refresh token in an HttpOnly cookie.
+	http.SetCookie(w, &http.Cookie{
+		Name:     "refresh_token",
+		Value:    refreshToken,
+		HttpOnly: true,
+		Secure:   false, // Set to true in production (with HTTPS).
+		Path:     "/",
+		Expires:  time.Now().Add(7 * 24 * time.Hour),
+	})
+
+	// Return the access token in the JSON response.
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(map[string]string{"access_token": accessToken})
 }
