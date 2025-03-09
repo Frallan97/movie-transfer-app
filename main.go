@@ -27,7 +27,7 @@ import (
 var s3Client *s3.Client
 
 func main() {
-	// Load environment variables from .env
+	// Load environment variables
 	if err := godotenv.Load(); err != nil {
 		log.Fatalf("Error loading .env file: %v", err)
 	}
@@ -45,6 +45,8 @@ func main() {
 	s3Client = s3.NewFromConfig(cfg)
 
 	commonChain := alice.New(logMiddleware, corsMiddleware)
+	http.Handle("/create-folder", commonChain.Then(http.HandlerFunc(createFolderHandler)))
+	http.Handle("/folders", commonChain.Then(http.HandlerFunc(listFoldersHandler)))
 	http.Handle("/upload", commonChain.Then(http.HandlerFunc(uploadHandler)))
 	http.Handle("/download", commonChain.Then(http.HandlerFunc(downloadHandler)))
 	http.Handle("/delete", commonChain.Then(http.HandlerFunc(deleteHandler)))
@@ -54,6 +56,7 @@ func main() {
 	log.Fatal(http.ListenAndServe(":8080", nil))
 }
 
+// logMiddleware logs each request.
 func logMiddleware(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		start := time.Now()
@@ -62,9 +65,10 @@ func logMiddleware(next http.Handler) http.Handler {
 	})
 }
 
+// corsMiddleware adds CORS headers.
 func corsMiddleware(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		w.Header().Set("Access-Control-Allow-Origin", "*")
+		w.Header().Set("Access-Control-Allow-Origin", "*") // For development only.
 		w.Header().Set("Access-Control-Allow-Methods", "GET, POST, DELETE, OPTIONS")
 		w.Header().Set("Access-Control-Allow-Headers", "Content-Type")
 		if r.Method == http.MethodOptions {
@@ -75,7 +79,60 @@ func corsMiddleware(next http.Handler) http.Handler {
 	})
 }
 
-// uploadHandler handles single or multiple file uploads concurrently.
+// createFolderHandler creates a new folder in S3 by putting an empty object with a trailing slash.
+func createFolderHandler(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		http.Error(w, "Method Not Allowed", http.StatusMethodNotAllowed)
+		return
+	}
+	var req struct {
+		Folder string `json:"folder"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		http.Error(w, "Invalid request body: "+err.Error(), http.StatusBadRequest)
+		return
+	}
+	folderName := strings.TrimSpace(req.Folder)
+	if folderName == "" {
+		http.Error(w, "Folder name required", http.StatusBadRequest)
+		return
+	}
+	key := folderName + "/"
+	_, err := s3Client.PutObject(context.TODO(), &s3.PutObjectInput{
+		Bucket: aws.String(os.Getenv("S3_BUCKET_NAME")),
+		Key:    aws.String(key),
+		Body:   strings.NewReader(""),
+	})
+	if err != nil {
+		http.Error(w, "Failed to create folder: "+err.Error(), http.StatusInternalServerError)
+		return
+	}
+	w.WriteHeader(http.StatusOK)
+	fmt.Fprintf(w, "Folder created: %s", folderName)
+}
+
+// listFoldersHandler lists folders using delimiter.
+func listFoldersHandler(w http.ResponseWriter, r *http.Request) {
+	bucket := os.Getenv("S3_BUCKET_NAME")
+	resp, err := s3Client.ListObjectsV2(context.TODO(), &s3.ListObjectsV2Input{
+		Bucket:    aws.String(bucket),
+		Delimiter: aws.String("/"),
+	})
+	if err != nil {
+		http.Error(w, "Failed to list folders: "+err.Error(), http.StatusInternalServerError)
+		return
+	}
+	var folders []string
+	for _, prefix := range resp.CommonPrefixes {
+		if prefix.Prefix != nil {
+			folders = append(folders, strings.TrimSuffix(*prefix.Prefix, "/"))
+		}
+	}
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(folders)
+}
+
+// uploadHandler supports multiple file uploads with an optional folder.
 func uploadHandler(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodPost {
 		http.Error(w, "Method Not Allowed", http.StatusMethodNotAllowed)
@@ -85,7 +142,7 @@ func uploadHandler(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "Error parsing multipart form: "+err.Error(), http.StatusBadRequest)
 		return
 	}
-
+	folder := strings.TrimSpace(r.FormValue("folder"))
 	form := r.MultipartForm
 	fileHeaders := form.File["file"]
 	if len(fileHeaders) == 0 {
@@ -110,7 +167,11 @@ func uploadHandler(w http.ResponseWriter, r *http.Request) {
 				return
 			}
 			defer file.Close()
-			url, err := uploadFileToS3(file, fh.Filename)
+			key := fh.Filename
+			if folder != "" {
+				key = folder + "/" + fh.Filename
+			}
+			url, err := uploadFileToS3(file, key)
 			if err != nil {
 				mu.Lock()
 				errors = append(errors, fmt.Sprintf("Error uploading file %s: %v", fh.Filename, err))
@@ -131,10 +192,9 @@ func uploadHandler(w http.ResponseWriter, r *http.Request) {
 	json.NewEncoder(w).Encode(response)
 }
 
-// downloadHandler handles downloading one or multiple files.
-// It expects a query parameter "filename" with a comma-separated list.
-// It URL-decodes each file name so that names with spaces/special characters match the S3 keys.
+// downloadHandler handles downloading one or multiple files with optional folder.
 func downloadHandler(w http.ResponseWriter, r *http.Request) {
+	folder := strings.TrimSpace(r.URL.Query().Get("folder"))
 	filenameParam := r.URL.Query().Get("filename")
 	if filenameParam == "" {
 		http.Error(w, "Filename query parameter is required", http.StatusBadRequest)
@@ -145,7 +205,10 @@ func downloadHandler(w http.ResponseWriter, r *http.Request) {
 		f = strings.TrimSpace(f)
 		decoded, err := url.QueryUnescape(f)
 		if err != nil {
-			decoded = f // fallback to original if error
+			decoded = f
+		}
+		if folder != "" {
+			decoded = folder + "/" + decoded
 		}
 		filenames[i] = decoded
 	}
@@ -170,7 +233,10 @@ func downloadHandler(w http.ResponseWriter, r *http.Request) {
 				return
 			}
 			defer resp.Body.Close()
-			zipFile, err := zipWriter.Create(filename)
+			// Store only the file name in the ZIP archive.
+			parts := strings.Split(filename, "/")
+			displayName := parts[len(parts)-1]
+			zipFile, err := zipWriter.Create(displayName)
 			if err != nil {
 				http.Error(w, "Failed to create zip entry for "+filename+": "+err.Error(), http.StatusInternalServerError)
 				return
@@ -190,8 +256,7 @@ func downloadHandler(w http.ResponseWriter, r *http.Request) {
 	}
 }
 
-// deleteHandler handles deleting one or multiple files.
-// It expects a JSON array of file names in the request body.
+// deleteHandler handles deleting one or multiple files with optional folder.
 func deleteHandler(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodDelete {
 		http.Error(w, "Method Not Allowed", http.StatusMethodNotAllowed)
@@ -202,11 +267,15 @@ func deleteHandler(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "Invalid request body: "+err.Error(), http.StatusBadRequest)
 		return
 	}
-	// URL-decode each file name and trim whitespace.
+	folder := strings.TrimSpace(r.URL.Query().Get("folder"))
 	for i, f := range filenames {
-		decoded, err := url.QueryUnescape(strings.TrimSpace(f))
+		f = strings.TrimSpace(f)
+		decoded, err := url.QueryUnescape(f)
 		if err != nil {
-			decoded = strings.TrimSpace(f) // fallback if decoding fails
+			decoded = f
+		}
+		if folder != "" {
+			decoded = folder + "/" + decoded
 		}
 		filenames[i] = decoded
 	}
@@ -239,40 +308,57 @@ func deleteHandler(w http.ResponseWriter, r *http.Request) {
 	json.NewEncoder(w).Encode(response)
 }
 
-
-// listFilesHandler lists all files in the S3 bucket.
+// listFilesHandler lists files in a folder.
+// If a "folder" query parameter is provided, only files with that prefix are listed (and prefix removed).
 func listFilesHandler(w http.ResponseWriter, r *http.Request) {
-	files, err := listFilesInS3()
+	folder := strings.TrimSpace(r.URL.Query().Get("folder"))
+	var prefix string
+	if folder != "" {
+		prefix = folder + "/"
+	}
+	resp, err := s3Client.ListObjectsV2(context.TODO(), &s3.ListObjectsV2Input{
+		Bucket: aws.String(os.Getenv("S3_BUCKET_NAME")),
+		Prefix: aws.String(prefix),
+	})
 	if err != nil {
 		http.Error(w, "Failed to list files in S3: "+err.Error(), http.StatusInternalServerError)
 		return
+	}
+	var files []string
+	for _, item := range resp.Contents {
+		name := *item.Key
+		if prefix != "" {
+			name = strings.TrimPrefix(name, prefix)
+		}
+		// Only show non-empty names (skip folder placeholder objects)
+		if name != "" {
+			files = append(files, name)
+		}
 	}
 	w.Header().Set("Content-Type", "application/json")
 	json.NewEncoder(w).Encode(files)
 }
 
-func uploadFileToS3(file multipart.File, filename string) (string, error) {
+func uploadFileToS3(file multipart.File, key string) (string, error) {
 	s3BucketName := os.Getenv("S3_BUCKET_NAME")
 	_, err := s3Client.PutObject(context.TODO(), &s3.PutObjectInput{
-		Bucket:          aws.String(s3BucketName),
-		Key:             aws.String(filename),
-		Body:            file,
-		ContentEncoding: aws.String("gzip"), // inform that the file is gzipped
+		Bucket: aws.String(s3BucketName),
+		Key:    aws.String(key),
+		Body:   file,
 	})
 	if err != nil {
 		return "", err
 	}
-	fileURL := fmt.Sprintf("https://%s.s3.%s.amazonaws.com/%s", s3BucketName, os.Getenv("AWS_REGION"), filename)
+	fileURL := fmt.Sprintf("https://%s.s3.%s.amazonaws.com/%s", s3BucketName, os.Getenv("AWS_REGION"), key)
 	return fileURL, nil
 }
 
-
-func generatePresignedURL(filename string) (string, error) {
+func generatePresignedURL(key string) (string, error) {
 	s3BucketName := os.Getenv("S3_BUCKET_NAME")
 	presignClient := s3.NewPresignClient(s3Client)
 	req, err := presignClient.PresignGetObject(context.TODO(), &s3.GetObjectInput{
 		Bucket: aws.String(s3BucketName),
-		Key:    aws.String(filename),
+		Key:    aws.String(key),
 	})
 	if err != nil {
 		return "", err
@@ -280,26 +366,11 @@ func generatePresignedURL(filename string) (string, error) {
 	return req.URL, nil
 }
 
-func listFilesInS3() ([]string, error) {
-	s3BucketName := os.Getenv("S3_BUCKET_NAME")
-	resp, err := s3Client.ListObjectsV2(context.TODO(), &s3.ListObjectsV2Input{
-		Bucket: aws.String(s3BucketName),
-	})
-	if err != nil {
-		return nil, err
-	}
-	var files []string
-	for _, item := range resp.Contents {
-		files = append(files, *item.Key)
-	}
-	return files, nil
-}
-
-func deleteFileFromS3(filename string) error {
+func deleteFileFromS3(key string) error {
 	s3BucketName := os.Getenv("S3_BUCKET_NAME")
 	_, err := s3Client.DeleteObject(context.TODO(), &s3.DeleteObjectInput{
 		Bucket: aws.String(s3BucketName),
-		Key:    aws.String(filename),
+		Key:    aws.String(key),
 	})
 	return err
 }
